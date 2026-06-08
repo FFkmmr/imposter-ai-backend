@@ -1,0 +1,1037 @@
+openapi: 3.0.3
+info:
+  title: Imposter AI API
+  version: 1.0.0
+  description: |
+    # Imposter AI — Backend Specification
+
+    Backend API для игры Imposter AI — управление категориями, AI-генерацией слов, premium-контентом и remote config.
+
+    ---
+
+    ## Сущности
+
+    ### Category
+    Описывает тематическую категорию слов. Делятся на free и premium через флаг `is_premium`.
+    Активность управляется через `is_active` — скрывает без удаления. `sort_order` определяет порядок в клиенте.
+    Все текстовые поля хранятся как LocalizedString — JSON-объект с ключами по ISO locale.
+
+    ### WordPack
+    Набор слов привязанный к категории. Создаётся отдельно под каждую локаль — автоматического перевода нет.
+    - Для стандартного режима `impostor_word = null` — impostor не получает слово.
+    - Для Party Mode (Undercover) `impostor_word` содержит похожее но отличное слово.
+    - При запросе клиент передаёт `locale`, сервер ищет подходящий пак; если нет — fallback на `en`.
+
+    ### FeatureConfig
+    Управление feature flags и контент-гейтингом. Клиент получает весь конфиг одним запросом `GET /config` при старте.
+    Флаги кешируются на клиенте с TTL 15–30 мин. `payload` может содержать лимиты AI-запросов для free-tier.
+    Ключи: `"ai_theme"`, `"premium_categories"`, `"party_mode_extra_roles"`.
+
+    ### AITopicRequestLog
+    Лог запросов на AI-генерацию — для дебага, модерации, rate limiting. Хранится для аудита, не возвращается клиенту.
+    `device_id` анонимный, не привязан к аккаунту. `raw_prompt` не логируется — может содержать персональные данные.
+    `was_rejected = true` если prompt не прошёл модерацию. Retention: записи удаляются через 90 дней.
+
+    ### LocalizationContent
+    Серверные строки локализации для контента который нельзя обновить без релиза (paywall, onboarding, promo).
+    Только для строк требующих серверного управления — большинство строк идут через нативный Localizable.strings.
+
+    ---
+
+    ## Логика Party Mode
+
+    ### Роли
+
+    **Civilian** — знает слово. Цель — вычислить импостера и проголосовать за него.
+
+    **Impostor** — не знает слово. Цель — не спалиться и выжить до победного условия.
+    Взаимоисключает Undercover: в матче либо Impostor либо Undercover на каждый импостер-слот.
+    При 2 импостерах возможна комбинация 1 Impostor + 1 Undercover.
+
+    **Undercover** — заменяет Impostor. Получает слово похожее на слово civilians но не то же самое.
+    Задача civilians — вычислить что его слово отличается. Задача Undercover — убедить всех что он civilian.
+
+    **Detective** *(дополнительная роль, поверх состава)* — является civilian, знает слово, играет на стороне мирных.
+    Абилка: может проверить одного игрока и получить подсказку является ли тот импостером.
+    Начинает с 0 зарядами. Заряд добавляется каждые 2 хода. Первая проверка доступна после хода 2.
+    Может быть исключён из матча в настройках.
+
+    **Joker** *(дополнительная роль, поверх состава)* — знает слово civilians.
+    Выигрывает если: импостер был выгнан первым → после этого выгнали Joker.
+    Проигрывает если дошло до ситуации 1 civilian + Joker без импостера → победа civilians.
+    Требует минимум 2 civilians (не считая себя) и минимум 2 импостера — иначе роль не назначается.
+    Причина: при 1 импостере civilians побеждают сразу после его выгона и у Joker нет шанса реализовать условие.
+    Может быть исключён из матча в настройках.
+
+    ### Условия победы
+    - **Civilians** — все импостеры (Impostor/Undercover) выгнаны голосованием
+    - **Impostor/Undercover** — остались 1 на 1 с civilians (без учёта Joker)
+    - **Joker** — импостер выгнан первым → следующим голосованием выгнан Joker
+
+    ### Валидация состава матча
+    - Detective и Joker могут присутствовать одновременно если позволяет число игроков.
+    - Joker не назначается если civilians < 2 (не считая Joker) или импостеров < 2.
+    - Detective и Joker назначаются случайно из пула civilians.
+    - Настройки матча позволяют включить/выключить каждую дополнительную роль отдельно.
+    - Double Impostor — не роль, а настройка матча (количество импостер-слотов = 2).
+
+    ---
+
+    ## Логика AI-генерации слов
+
+    ### Флоу генерации темы (POST /ai/generate-theme)
+    1. Клиент отправляет: `{ topic, locale, mode }`.
+    2. Сервер очищает prompt: обрезает до 80 символов, убирает спецсимволы.
+    3. Сервер проверяет тему по blacklist (список запрещённых слов/паттернов на regex).
+    4. Если blocked → возвращает `fallback_used: true` + случайный curated word. Клиент получает 200, не ошибку.
+    5. Если прошло → проверяет пул слов для данного `sanitized_prompt + locale`:
+       - Из пула исключаются слова уже выданные этому `device_id`.
+       - Если остались доступные слова → выдаётся одно случайное из них.
+       - Если все слова пула исчерпаны → переходим к шагу 6.
+    6. Если нет доступных слов → формирует системный промпт для LLM (язык, режим, guardrails).
+    7. Вызов LLM. Таймаут: 5 секунд.
+    8. Парсинг и валидация ответа LLM.
+    9. Post-generation проверка через OpenAI Moderation API.
+    10. Новые слова добавляются в пул. Выдаётся одно случайное из только что полученных новых слов.
+    11. Логирование в AITopicRequestLog.
+    12. Возврат клиенту.
+
+    ### Логика пула слов
+    - Пул хранится в Redis с ключом `topic_pool:{sanitized_prompt}:{locale}`. Без TTL — накапливается со временем.
+    - История выданных слов хранится на сервере: ключ `device_history:{device_id}:{sanitized_prompt}:{locale}`. TTL: 30 дней.
+    - При каждом запросе сервер сам исключает из пула слова уже выданные этому устройству — клиент ничего дополнительно не передаёт.
+
+    ### Fallback-цепочка
+    - LLM timeout (5 сек) → случайный word из категории с похожими тегами.
+    - Moderation rejected → curated fallback из default категории.
+    - Rate limit exceeded → curated fallback из default категории.
+    - `500` только если вообще нет контента для fallback (не должно происходить в production).
+
+    ### Флоу генерации слов по теме (POST /ai/generate-words)
+    Аналогично generate-theme, но список из N слов для полного WordPack.
+    Используется для admin-панели и контент-команды в MVP. Лимит: 20–30 слов на запрос.
+    В Phase 2 планируется как клиентский эндпоинт.
+
+    ---
+
+    ## Логика premium / paywall
+
+    ### Entitlement flow
+    1. Клиент после успешной транзакции в StoreKit 2 отправляет receipt/transaction token на `POST /purchase/validate`.
+    2. Backend верифицирует через Apple App Store Server API.
+    3. При успехе возвращает `{ is_valid: true, product_id, expires_at, entitlement_token }`.
+    4. `entitlement_token` — подписанный JWT (RS256), payload: `{ device_id, product_id, expires_at }`.
+    5. Клиент хранит `entitlement_token` локально. TTL токена = срок подписки.
+    6. При запросе premium-контента клиент передаёт токен в заголовке `X-Entitlement-Token`.
+    7. Backend верифицирует подпись и TTL токена без обращения к Apple на каждый запрос.
+    8. Периодическая ре-валидация: клиент обновляет токен при каждом cold start если до истечения < 7 дней.
+
+    Если backend недоступен → клиент работает с последним известным токеном + Grace Period 7 дней.
+    Рекомендуется RevenueCat как proxy-слой — упрощает логику на backend.
+
+    ---
+
+    ## Логика категорий и контента
+
+    - `GET /categories` — возвращает все активные категории. TTL кеша: 30 мин. Пагинация не нужна (< 50 категорий).
+    - `GET /categories/premium` — только premium с `preview_words` (2–3 слова) для paywall-экрана.
+    - `GET /categories/{id}/words` — для premium требует `X-Entitlement-Token`. Токен проверяется локально без обращения к Apple.
+    - Offline-категории бандлятся в приложение. Premium online-категории — запрос к API при наличии интернета.
+
+    ---
+
+    ## Remote Config
+
+    Запрашивается при каждом cold start. Кешируется локально с TTL 15–30 мин.
+    При недоступности сервера клиент использует last known good config.
+    Критические флаги (force update) проверяются до входа в игру.
+
+    ---
+
+    ## Rate Limiting
+
+    | Endpoint | Free | Premium |
+    |---|---|---|
+    | POST /ai/generate-theme | 5 / 24h / device | 50 / 24h / device |
+    | POST /ai/generate-words | только admin | только admin |
+    | GET /categories/{id}/words | 100 / 24h / device | unlimited |
+    | GET /categories | unlimited | unlimited |
+    | GET /config | unlimited | unlimited |
+
+    - Rate limit по `device_id` (anonymous), не по IP.
+    - Окно: rolling 24 hours (не сброс в midnight UTC). Хранилище: Redis.
+    - При превышении → ответ `429` с телом (`fallback_used: true` + curated слово) — клиент обрабатывает как успех.
+    - Заголовки в ответе: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (Unix timestamp).
+
+    ---
+
+    ## Контент-модерация
+
+    Слои защиты:
+    1. **Client-side** — ограничение длины prompt (80 символов), базовый UI hint.
+    2. **Server blacklist** — список запрещённых слов/паттернов на regex.
+    3. **System prompt guardrails** — инструкции LLM отказать на NSFW/hate/illegal.
+    4. **Post-generation check** — ответ LLM проверяется через OpenAI Moderation API.
+    5. **Logging** — все rejected requests логируются в AITopicRequestLog для аудита.
+
+    Клиент всегда получает валидный ответ 200 — никогда не отдавать "запрос заблокирован" как ошибку.
+
+    ---
+
+    ## Нефункциональные требования
+
+    | Требование | Значение |
+    |---|---|
+    | P95 latency /ai/generate-theme | < 3 секунды |
+    | P95 latency /categories, /config | < 200 мс |
+    | Uptime | 99.5% |
+    | Rate limit storage | Redis |
+    | AI topic word pool | Redis, без TTL |
+    | Device history TTL | 30 дней |
+    | Categories cache | Redis, TTL 30 мин |
+    | Localizations cache | Redis, TTL 1h |
+    | LLM таймаут | 5 секунд |
+    | LLM fallback | немедленный, transparent для клиента |
+    | AITopicRequestLog retention | 90 дней, затем удаление |
+    | Entitlement token алгоритм | RS256 JWT |
+    | Rate limit window | Rolling 24h (не UTC midnight сброс) |
+
+    ---
+
+servers:
+  - url: https://api.imposterai.app/v1
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    EntitlementToken:
+      type: apiKey
+      in: header
+      name: X-Entitlement-Token
+
+  parameters:
+    DeviceId:
+      name: X-Device-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Анонимный идентификатор устройства, генерируется при первом запуске
+    AppVersion:
+      name: X-App-Version
+      in: header
+      required: true
+      schema:
+        type: string
+        example: "1.0.0"
+    LocaleHeader:
+      name: X-Locale
+      in: header
+      required: false
+      schema:
+        type: string
+        example: "ru"
+      description: ISO 639-1 код языка
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: RATE_LIMIT_EXCEEDED
+            message:
+              type: string
+              example: AI request limit reached for today
+            details:
+              nullable: true
+              example: null
+
+    Category:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+          example: animals
+        name:
+          type: string
+          example: Animals
+        description:
+          type: string
+          example: Guess the animal
+        is_premium:
+          type: boolean
+        is_active:
+          type: boolean
+        cover_image_url:
+          type: string
+          nullable: true
+          example: https://cdn.../animals.png
+        sort_order:
+          type: integer
+          example: 1
+
+    CategoryPremium:
+      allOf:
+        - $ref: '#/components/schemas/Category'
+        - type: object
+          properties:
+            preview_words:
+              type: array
+              items:
+                type: string
+              example: ["Matrix", "Avatar"]
+
+    WordEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        civilian_word:
+          type: string
+          example: Elephant
+        impostor_word:
+          type: string
+          nullable: true
+          example: null
+        difficulty:
+          type: string
+          enum: [easy, medium, hard]
+        tags:
+          type: array
+          items:
+            type: string
+          example: []
+
+    AIThemeResponse:
+      type: object
+      properties:
+        locale:
+          type: string
+          example: ru
+        topic:
+          type: string
+          example: космос
+        civilian_word:
+          type: string
+          example: Марс
+        impostor_word:
+          type: string
+          nullable: true
+          example: null
+        difficulty:
+          type: string
+          enum: [easy, medium, hard]
+        is_safe:
+          type: boolean
+        fallback_used:
+          type: boolean
+        fallback_reason:
+          type: string
+          nullable: true
+          enum: [ai_unavailable, moderation_rejected, rate_limit_exceeded]
+
+paths:
+  /categories:
+    get:
+      summary: Список всех активных категорий
+      description: Возвращает все активные категории (free + premium) для отображения в пикере.
+      tags: [Categories]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+        - name: locale
+          in: query
+          required: false
+          schema:
+            type: string
+            default: en
+          description: ISO locale. Default en
+      responses:
+        '200':
+          description: Список категорий
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: max-age=1800
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Category'
+              example:
+                categories:
+                  - id: "550e8400-e29b-41d4-a716-446655440000"
+                    slug: animals
+                    name: Animals
+                    description: Guess the animal
+                    is_premium: false
+                    cover_image_url: "https://cdn.../animals.png"
+                    sort_order: 1
+                  - id: "550e8400-e29b-41d4-a716-446655440001"
+                    slug: cinema
+                    name: Cinema
+                    description: Movies & TV
+                    is_premium: true
+                    cover_image_url: "https://cdn.../cinema.png"
+                    sort_order: 10
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /categories/premium:
+    get:
+      summary: Список premium категорий с preview
+      description: Возвращает только premium категории с preview_words. Используется на paywall-экране.
+      tags: [Categories]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+        - name: locale
+          in: query
+          required: false
+          schema:
+            type: string
+            default: en
+      responses:
+        '200':
+          description: Список premium категорий
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: max-age=1800
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CategoryPremium'
+              example:
+                categories:
+                  - id: "550e8400-e29b-41d4-a716-446655440001"
+                    slug: cinema
+                    name: Cinema
+                    description: Movies & TV
+                    is_premium: true
+                    cover_image_url: "https://cdn.../cinema.png"
+                    sort_order: 10
+                    preview_words: ["Matrix", "Avatar"]
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /categories/{category_id}/words:
+    get:
+      summary: Слова для категории
+      description: |
+        Возвращает слова для конкретной категории. Для premium-категорий требует X-Entitlement-Token.
+        Если WordPack для запрошенной локали не найден — сервер возвращает fallback на `en`, не ошибку.
+      tags: [Categories]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+        - name: X-Entitlement-Token
+          in: header
+          required: false
+          schema:
+            type: string
+          description: JWT токен entitlement. Обязателен для premium-категорий. Отсутствие → 401, невалидный/истёкший → 403.
+        - name: category_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: ID категории
+        - name: locale
+          in: query
+          required: false
+          schema:
+            type: string
+            default: en
+          description: ISO locale. Fallback en
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [standard, party]
+            default: standard
+        - name: count
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+            maximum: 5
+          description: Количество слов для раунда
+      responses:
+        '200':
+          description: Слова категории
+          headers:
+            X-RateLimit-Limit:
+              schema:
+                type: integer
+              example: 100
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+              example: 99
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+              description: Unix timestamp когда освободится первый слот
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  category_id:
+                    type: string
+                    format: uuid
+                  locale:
+                    type: string
+                  mode:
+                    type: string
+                    enum: [standard, party]
+                  words:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WordEntry'
+              example:
+                category_id: "550e8400-e29b-41d4-a716-446655440000"
+                locale: en
+                mode: standard
+                words:
+                  - id: "550e8400-e29b-41d4-a716-446655440010"
+                    civilian_word: Elephant
+                    impostor_word: null
+                    difficulty: easy
+        '401':
+          description: Отсутствует X-Entitlement-Token для premium категории
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Токен невалиден или истёк
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Категория не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+
+  /ai/generate-theme:
+    post:
+      summary: Генерация слова по теме
+      description: |
+        Генерирует слово или пару слов по пользовательской теме через LLM.
+
+        **Логика пула слов:** сервер хранит историю выданных слов по device_id с TTL 30 дней.
+        При повторном запросе той же темы выдаётся слово которое устройство ещё не получало.
+        Если все слова исчерпаны — LLM генерирует новые и добавляет в пул.
+
+        **Fallback:** при недоступности LLM, превышении rate limit или отклонении модерацией
+        возвращается curated слово с fallback_used: true. Клиент обрабатывает как успех.
+      tags: [AI]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, locale]
+              properties:
+                topic:
+                  type: string
+                  maxLength: 80
+                  example: космос
+                  description: Пользовательская тема
+                locale:
+                  type: string
+                  example: ru
+                  description: ISO locale — язык ответа
+                mode:
+                  type: string
+                  enum: [standard, party]
+                  default: standard
+                  description: standard — одно слово для civilians; party — civilian_word + impostor_word
+      responses:
+        '200':
+          description: |
+            Успешный ответ. Включает fallback-случаи (fallback_used: true).
+          headers:
+            X-RateLimit-Limit:
+              schema:
+                type: integer
+              example: 5
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+              example: 2
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+              description: Unix timestamp когда освободится первый слот
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIThemeResponse'
+              examples:
+                standard:
+                  summary: Стандартный режим
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Марс
+                    impostor_word: null
+                    difficulty: medium
+                    is_safe: true
+                    fallback_used: false
+                party:
+                  summary: Party mode
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Марс
+                    impostor_word: Луна
+                    difficulty: medium
+                    is_safe: true
+                    fallback_used: false
+                fallback:
+                  summary: Fallback ответ
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Земля
+                    impostor_word: null
+                    difficulty: easy
+                    is_safe: true
+                    fallback_used: true
+                    fallback_reason: ai_unavailable
+        '400':
+          description: topic пустой или превышает 80 символов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: |
+            Превышен rate limit. Тело содержит fallback_used: true + curated слово.
+            Клиент обрабатывает как успех, не как ошибку.
+          headers:
+            X-RateLimit-Limit:
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+                example: 0
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIThemeResponse'
+              example:
+                locale: ru
+                topic: космос
+                civilian_word: Земля
+                impostor_word: null
+                difficulty: easy
+                is_safe: true
+                fallback_used: true
+                fallback_reason: rate_limit_exceeded
+        '500':
+          description: Внутренняя ошибка (только если нет контента для fallback)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: LLM или внешний сервис временно недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /ai/generate-words:
+    post:
+      summary: Генерация набора слов для WordPack (только admin)
+      description: |
+        Генерирует полный набор слов по теме для наполнения WordPack.
+        Только для internal use — admin-панели и контент-команды.
+        Недоступен обычным пользователям (free и premium).
+      tags: [AI]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, locale]
+              properties:
+                topic:
+                  type: string
+                  example: Space exploration
+                locale:
+                  type: string
+                  example: en
+                count:
+                  type: integer
+                  minimum: 10
+                  maximum: 30
+                  default: 20
+                  example: 20
+                  description: |
+                    Желаемое количество слов. Минимум 10, по умолчанию 20, максимум 30.
+                    Если LLM вернул меньше 10 слов — сервер автоматически повторяет запрос
+                    и добирает слова до минимума без участия клиента.
+                mode:
+                  type: string
+                  enum: [standard, party]
+                  default: standard
+                difficulty:
+                  type: string
+                  enum: [easy, medium, hard]
+                  example: medium
+      responses:
+        '200':
+          description: Сгенерированный набор слов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  locale:
+                    type: string
+                  topic:
+                    type: string
+                  words:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        civilian_word:
+                          type: string
+                        impostor_word:
+                          type: string
+                          nullable: true
+                        difficulty:
+                          type: string
+                          enum: [easy, medium, hard]
+                        is_safe:
+                          type: boolean
+                  total:
+                    type: integer
+                    description: Количество возвращённых слов после фильтрации
+                  unsafe_filtered:
+                    type: integer
+                    description: Количество слов отфильтрованных модерацией
+              example:
+                locale: en
+                topic: Space exploration
+                words:
+                  - civilian_word: Mars
+                    impostor_word: Moon
+                    difficulty: medium
+                    is_safe: true
+                  - civilian_word: Rocket
+                    impostor_word: Satellite
+                    difficulty: easy
+                    is_safe: true
+                total: 19
+                unsafe_filtered: 1
+        '400':
+          description: Невалидные поля запроса (topic или locale отсутствуют)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Отсутствует или невалидный Bearer токен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: LLM временно недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /config:
+    get:
+      summary: Remote config приложения
+      description: |
+        Возвращает полный remote config приложения.
+        Запрашивается при каждом cold start. Кешируется локально с TTL 15–30 мин.
+        При недоступности сервера клиент использует last known good config.
+      tags: [Config]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+      responses:
+        '200':
+          description: Remote config
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: max-age=900
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  features:
+                    type: object
+                  content:
+                    type: object
+                  app:
+                    type: object
+                  updated_at:
+                    type: string
+                    format: date-time
+              example:
+                features:
+                  ai_theme:
+                    enabled: true
+                    free_daily_limit: 5
+                    premium_daily_limit: 50
+                  premium_categories:
+                    enabled: true
+                  party_mode_extra_roles:
+                    enabled: true
+                    is_premium: false
+                  import_custom_words:
+                    enabled: true
+                content:
+                  default_free_categories: ["animals", "food", "movies"]
+                  featured_category_slug: cinema
+                app:
+                  min_supported_version: "1.0.0"
+                  force_update_version: null
+                  maintenance_mode: false
+                updated_at: "2026-06-06T12:00:00Z"
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /localizations:
+    get:
+      summary: Серверные строки локализации
+      description: |
+        Строки локализации для контента требующего обновления без релиза приложения
+        (paywall тексты, промо, onboarding). Включён в scope MVP.
+      tags: [Config]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+        - name: locale
+          in: query
+          required: true
+          schema:
+            type: string
+            example: ru
+          description: ISO locale
+        - name: keys
+          in: query
+          required: false
+          schema:
+            type: string
+            example: "paywall.title,paywall.subtitle"
+          description: Comma-separated список нужных ключей. Если пусто — все
+      responses:
+        '200':
+          description: Строки локализации
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: max-age=3600
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  locale:
+                    type: string
+                  strings:
+                    type: object
+                    additionalProperties:
+                      type: string
+              example:
+                locale: ru
+                strings:
+                  paywall.title: "Открой всё"
+                  paywall.subtitle: "AI-темы, премиум-категории и многое другое"
+                  onboarding.step1.title: "Раздаём роли"
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /purchase/validate:
+    post:
+      summary: Валидация Apple IAP транзакции
+      description: |
+        Верифицирует Apple IAP транзакцию через Apple App Store Server API.
+        Возвращает entitlement_token — JWT (RS256) для авторизации последующих
+        premium-запросов без повторного обращения к Apple.
+
+        Если backend недоступен (503), клиент применяет Grace Period 7 дней.
+      tags: [Purchase]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/LocaleHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transaction_id, receipt_data, product_id]
+              properties:
+                transaction_id:
+                  type: string
+                  example: "..."
+                receipt_data:
+                  type: string
+                  example: "..."
+                product_id:
+                  type: string
+                  example: com.imposterai.premium.monthly
+      responses:
+        '200':
+          description: Результат валидации (valid или invalid)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_valid:
+                    type: boolean
+                  product_id:
+                    type: string
+                    nullable: true
+                  expires_at:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  environment:
+                    type: string
+                    nullable: true
+                    enum: [production, sandbox]
+                  entitlement_token:
+                    type: string
+                    nullable: true
+                  reason:
+                    type: string
+                    nullable: true
+              examples:
+                valid:
+                  summary: Валидная транзакция
+                  value:
+                    is_valid: true
+                    product_id: com.imposterai.premium.monthly
+                    expires_at: "2026-07-06T12:00:00Z"
+                    environment: production
+                    entitlement_token: "<signed_jwt>"
+                invalid:
+                  summary: Невалидная транзакция
+                  value:
+                    is_valid: false
+                    reason: receipt_expired
+        '400':
+          description: Невалидные поля запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Apple API временно недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+tags:
+  - name: Categories
+    description: Категории и слова
+  - name: AI
+    description: AI-генерация слов и тем
+  - name: Config
+    description: Remote config и локализация
+  - name: Purchase
+    description: Валидация покупок и premium-доступ
