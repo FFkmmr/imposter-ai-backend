@@ -198,6 +198,114 @@ info:
 
     ---
 
+    ## Флоу запуска игры (iOS)
+
+    Игра полностью локальная — сервер не ведёт игровую сессию, не знает о составе игроков и ходах.
+    Вся игровая логика (раздача ролей, голосование, победа) выполняется на клиенте.
+    Сервер отвечает только за контент (слова), конфиг и entitlement.
+
+    ### Cold Start (при каждом запуске приложения)
+
+    Два параллельных запроса:
+    - `GET /config` — feature flags, лимиты, force update, maintenance mode
+    - `GET /localizations` — paywall/onboarding тексты (если нужны на текущем экране)
+
+    Клиент кеширует оба ответа локально с TTL из `Cache-Control`. При недоступности сервера — использует последний known good.
+    Критическая проверка до входа в игру: `app.force_update_version` и `app.maintenance_mode` из `/config`.
+
+    ### Экран выбора категории
+
+    `GET /categories?locale={locale}` — все активные категории (free + premium) с флагом `is_premium`.
+    Клиент сам рисует lock-иконку на premium-категориях на основе наличия валидного `entitlement_token`.
+
+    Если пользователь нажимает на premium-категорию без entitlement → показывает paywall. Перед paywall-экраном:
+    `GET /categories/premium?locale={locale}` — premium-категории с `preview_words` для отображения на paywall.
+    После покупки: `POST /purchase/validate` → получить `entitlement_token`.
+
+    ### Настройка раунда (только клиент, сервер не вызывается)
+
+    Игроки вводят имена, выбирают настройки:
+    - Количество импостеров (1 или 2 — Double Impostor)
+    - Включить Detective (да/нет)
+    - Включить Joker (да/нет)
+    - Режим: standard / party
+
+    Валидация состава матча (Joker требует ≥2 civilians и ≥2 импостеров, Detective — дополнительная роль поверх состава) — на клиенте.
+
+    ### Старт раунда — получение слова
+
+    Два взаимоисключающих сценария:
+
+    **Вариант A — категория из библиотеки:**
+    `GET /categories/{category_id}/words?locale={locale}&mode={mode}&count=1`
+    Заголовок `X-Entitlement-Token` обязателен для premium-категорий.
+    Клиент получает `WordEntry` с `civilian_word` и `impostor_word` (null для standard).
+
+    **Вариант B — пользователь ввёл свою тему:**
+    `POST /ai/generate-theme` с телом `{ topic, locale, mode }`
+    Клиент получает `AIThemeResponse` с теми же полями.
+
+    В обоих случаях сервер возвращает одну пару слов. Клиент раздаёт роли локально.
+
+    ### Раздача ролей (только клиент, сервер не участвует)
+
+    1. Клиент определяет список ролей на основе настроек матча и числа игроков.
+    2. Перемешивает роли случайно.
+    3. Каждый игрок по очереди берёт устройство и видит свою роль + слово.
+    4. Civilian → `civilian_word`, Undercover → `impostor_word`, Impostor → слова нет, Detective/Joker → `civilian_word`.
+
+    ### Игровой процесс и завершение (только клиент)
+
+    Сервер не вызывается. Клиент ведёт:
+    - Список активных игроков
+    - Стадию игры: обсуждение → голосование → результат
+    - Заряды Detective (0 зарядов, +1 каждые 2 хода, первая проверка после хода 2)
+    - Счётчик выгнанных (для определения победы Joker)
+
+    Проверка победы — на клиенте по условиям ролей из раздела "Логика Party Mode".
+
+    ### Повторный раунд
+
+    Клиент запрашивает новое слово заново — тот же флоу старта раунда.
+    Предыдущая сессия на сервер не передаётся.
+
+    ### Диаграмма вызовов по экранам
+
+    ```
+    App Launch
+      ├── GET /config
+      └── GET /localizations
+
+    Category Picker
+      └── GET /categories
+
+    [нет entitlement + нажата premium-категория]
+      └── GET /categories/premium      → Paywall экран
+            └── POST /purchase/validate → получить entitlement_token
+
+    Round Setup
+      └── (нет запросов)
+
+    Round Start
+      ├── [категория из библиотеки]  GET /categories/{id}/words
+      └── [пользователь ввёл тему]   POST /ai/generate-theme
+
+    In-Game
+      └── (нет запросов)
+
+    Next Round
+      └── повтор Round Start
+    ```
+
+    ### Важные детали клиента
+
+    - `X-Device-Id` — UUID, генерируется при первом запуске, хранится в Keychain, передаётся в каждом запросе.
+    - `entitlement_token` — хранится в Keychain. Обновляется при cold start если до истечения < 7 дней (повторный `POST /purchase/validate`).
+    - Offline для free-категорий: слова бандлятся в приложение, сеть не нужна.
+    - Offline для premium: клиент показывает ошибку, игровой flow не ломается.
+
+    ---
+
 servers:
   - url: https://api.imposterai.app/v1
 
@@ -1028,10 +1136,34 @@ paths:
 
 tags:
   - name: Categories
-    description: Категории и слова
+    description: |
+      Категории и слова.
+
+      Вызывается на экране выбора категории (`GET /categories`) и при старте раунда (`GET /categories/{id}/words`).
+      Premium-категории с preview запрашиваются перед paywall-экраном (`GET /categories/premium`).
   - name: AI
-    description: AI-генерация слов и тем
+    description: |
+      AI-генерация слов и тем.
+
+      Вызывается при старте раунда если пользователь ввёл свою тему вместо выбора из библиотеки (`POST /ai/generate-theme`).
+      `POST /ai/generate-words` — только для admin/контент-команды.
   - name: Config
-    description: Remote config и локализация
+    description: |
+      Remote config и локализация.
+
+      Оба эндпоинта вызываются при каждом cold start параллельно.
+      Ответы кешируются локально. При недоступности сервера клиент использует last known good.
   - name: Purchase
-    description: Валидация покупок и premium-доступ
+    description: |
+      Валидация покупок и premium-доступ.
+
+      Вызывается после успешной транзакции в StoreKit 2. Возвращает `entitlement_token` (JWT RS256),
+      который клиент хранит в Keychain и передаёт в `X-Entitlement-Token` при запросе premium-контента.
+      Обновляется при cold start если до истечения токена < 7 дней.
+  - name: Game Flow
+    description: |
+      Справочный раздел — полный флоу запуска игры на iOS описан в разделе
+      "Флоу запуска игры (iOS)" в начале документации (info.description).
+
+      Игра полностью локальная. Сервер не вызывается в ходе игрового процесса —
+      только при старте (cold start), выборе категории, старте раунда и покупке.
