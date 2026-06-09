@@ -116,18 +116,9 @@ info:
 
     ## Логика premium / paywall
 
-    ### Entitlement flow
-    1. Клиент после успешной транзакции в StoreKit 2 отправляет receipt/transaction token на `POST /purchase/validate`.
-    2. Backend верифицирует через Apple App Store Server API.
-    3. При успехе возвращает `{ is_valid: true, product_id, expires_at, entitlement_token }`.
-    4. `entitlement_token` — подписанный JWT (RS256), payload: `{ device_id, product_id, expires_at }`.
-    5. Клиент хранит `entitlement_token` локально. TTL токена = срок подписки.
-    6. При запросе premium-контента клиент передаёт токен в заголовке `X-Entitlement-Token`.
-    7. Backend верифицирует подпись и TTL токена без обращения к Apple на каждый запрос.
-    8. Периодическая ре-валидация: клиент обновляет токен при каждом cold start если до истечения < 7 дней.
-
-    Если backend недоступен → клиент работает с последним известным токеном + Grace Period 7 дней.
-    Рекомендуется RevenueCat как proxy-слой — упрощает логику на backend.
+    Premium-статус управляется через Adapty. После успешной покупки в StoreKit 2 Adapty
+    автоматически отправляет webhook на `POST /webhooks/adapty` — сервер обновляет `is_premium`
+    и `premium_expires_at` в профиле пользователя. Клиент читает актуальный статус через `GET /users/me`.
 
     ---
 
@@ -135,7 +126,7 @@ info:
 
     - `GET /categories` — возвращает все активные категории. TTL кеша: 30 мин. Пагинация не нужна (< 50 категорий).
     - `GET /categories/premium` — только premium с `preview_words` (2–3 слова) для paywall-экрана.
-    - `GET /categories/{id}/words` — для premium требует `X-Entitlement-Token`. Токен проверяется локально без обращения к Apple.
+    - `GET /categories/{id}/words` — для premium проверяет `is_premium` в профиле пользователя.
     - Offline-категории бандлятся в приложение. Premium online-категории — запрос к API при наличии интернета.
 
     ---
@@ -193,7 +184,7 @@ info:
     | LLM таймаут | 5 секунд |
     | LLM fallback | немедленный, transparent для клиента |
     | AITopicRequestLog retention | 90 дней, затем удаление |
-    | Entitlement token алгоритм | RS256 JWT |
+    | JWT алгоритм (access_token) | RS256 |
     | Rate limit window | Rolling 24h (не UTC midnight сброс) |
 
     ---
@@ -202,7 +193,7 @@ info:
 
     Игра полностью локальная — сервер не ведёт игровую сессию, не знает о составе игроков и ходах.
     Вся игровая логика (раздача ролей, голосование, победа) выполняется на клиенте.
-    Сервер отвечает только за контент (слова), конфиг и entitlement.
+    Сервер отвечает только за контент (слова), конфиг и профиль пользователя.
 
     ### Cold Start (при каждом запуске приложения)
 
@@ -216,11 +207,11 @@ info:
     ### Экран выбора категории
 
     `GET /categories?locale={locale}` — все активные категории (free + premium) с флагом `is_premium`.
-    Клиент сам рисует lock-иконку на premium-категориях на основе наличия валидного `entitlement_token`.
+    Клиент рисует lock-иконку на premium-категориях на основе `is_premium` из профиля пользователя.
 
-    Если пользователь нажимает на premium-категорию без entitlement → показывает paywall. Перед paywall-экраном:
+    Если пользователь нажимает на premium-категорию без подписки → показывает paywall. Перед paywall-экраном:
     `GET /categories/premium?locale={locale}` — premium-категории с `preview_words` для отображения на paywall.
-    После покупки: `POST /purchase/validate` → получить `entitlement_token`.
+    После покупки через StoreKit 2 Adapty присылает webhook → сервер обновляет профиль.
 
     ### Настройка раунда (только клиент, сервер не вызывается)
 
@@ -238,7 +229,6 @@ info:
 
     **Вариант A — категория из библиотеки:**
     `GET /categories/{category_id}/words?locale={locale}&mode={mode}&count=1`
-    Заголовок `X-Entitlement-Token` обязателен для premium-категорий.
     Клиент получает `WordEntry` с `civilian_word` и `impostor_word` (null для standard).
 
     **Вариант B — пользователь ввёл свою тему:**
@@ -279,9 +269,9 @@ info:
     Category Picker
       └── GET /categories
 
-    [нет entitlement + нажата premium-категория]
+    [is_premium = false + нажата premium-категория]
       └── GET /categories/premium      → Paywall экран
-            └── POST /purchase/validate → получить entitlement_token
+            └── [покупка через StoreKit 2 → Adapty webhook → профиль обновлён]
 
     Round Setup
       └── (нет запросов)
@@ -300,9 +290,27 @@ info:
     ### Важные детали клиента
 
     - `X-Device-Id` — UUID, генерируется при первом запуске, хранится в Keychain, передаётся в каждом запросе.
-    - `entitlement_token` — хранится в Keychain. Обновляется при cold start если до истечения < 7 дней (повторный `POST /purchase/validate`).
     - Offline для free-категорий: слова бандлятся в приложение, сеть не нужна.
     - Offline для premium: клиент показывает ошибку, игровой flow не ломается.
+
+    ---
+
+    ## Аутентификация API
+
+    Двухуровневая модель доступа:
+
+    ### API_KEY (X-Api-Key)
+    Обязателен для всех клиентских эндпоинтов (`/categories`, `/ai/*`, `/config`, `/localizations`, `/users/*`).
+    Передаётся в заголовке `X-Api-Key`. Ротируется при компрометации.
+
+    ### ADMIN_API_KEY (X-Admin-Api-Key)
+    Обязателен только для `/admin/*` эндпоинтов. Передаётся в заголовке `X-Admin-Api-Key`.
+    Предоставляет расширенный доступ: пополнение токенов пользователям, управление контентом.
+    Хранится только на стороне сервера и доверенных admin-клиентов. Никогда не передаётся в мобильное приложение.
+
+    ### Webhooks
+    Эндпоинты `/webhooks/*` не используют стандартный `X-Api-Key`.
+    Верификация осуществляется через payload-специфичные заголовки (например, `Adapty-Signature` для Adapty).
 
     ---
 
@@ -318,14 +326,10 @@ components:
       type: apiKey
       in: header
       name: X-Api-Key
-    BearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
-    EntitlementToken:
+    AdminApiKeyAuth:
       type: apiKey
       in: header
-      name: X-Entitlement-Token
+      name: X-Admin-Api-Key
 
   parameters:
     DeviceId:
@@ -428,6 +432,95 @@ components:
           items:
             type: string
           example: []
+
+    UserProfile:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Внутренний идентификатор пользователя
+        device_id:
+          type: string
+          format: uuid
+          description: Анонимный идентификатор устройства
+        tokens:
+          type: integer
+          default: 0
+          description: Текущий баланс токенов
+        is_premium:
+          type: boolean
+          description: Наличие активной premium-подписки
+        premium_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Дата истечения premium-подписки (null если нет подписки)
+        created_at:
+          type: string
+          format: date-time
+          description: Дата и время регистрации пользователя
+      required:
+        - id
+        - device_id
+        - tokens
+        - is_premium
+        - created_at
+
+    CreateUserRequest:
+      type: object
+      required: [device_id]
+      properties:
+        device_id:
+          type: string
+          format: uuid
+          description: Анонимный идентификатор устройства
+
+    AddTokensRequest:
+      type: object
+      required: [device_id, tokens_amount]
+      properties:
+        device_id:
+          type: string
+          format: uuid
+          description: device_id пользователя
+        tokens_amount:
+          type: integer
+          minimum: 1
+          description: Количество токенов для начисления
+
+    AdaptyWebhookPayload:
+      type: object
+      required: [event_type, profile_id]
+      properties:
+        event_type:
+          type: string
+          example: subscription_renewed
+          description: Тип события Adapty
+        profile_id:
+          type: string
+          description: Внутренний ID профиля Adapty
+        customer_user_id:
+          type: string
+          nullable: true
+          description: |
+            customer_user_id в Adapty — равен device_id пользователя.
+            По этому полю сервер находит пользователя при обработке события.
+        paid_access_level:
+          type: object
+          nullable: true
+          description: Данные уровня доступа (premium entitlement)
+          properties:
+            id:
+              type: string
+              example: premium
+            is_active:
+              type: boolean
+            expires_at:
+              type: string
+              format: date-time
+              nullable: true
+        additionalProperties: true
 
     AIThemeResponse:
       type: object
@@ -567,19 +660,13 @@ paths:
     get:
       summary: Слова для категории
       description: |
-        Возвращает слова для конкретной категории. Для premium-категорий требует X-Entitlement-Token.
+        Возвращает слова для конкретной категории. Для premium-категорий проверяет is_premium в профиле пользователя.
         Если WordPack для запрошенной локали не найден — сервер возвращает fallback на `en`, не ошибку.
       tags: [Categories]
       parameters:
         - $ref: '#/components/parameters/DeviceId'
         - $ref: '#/components/parameters/AppVersion'
         - $ref: '#/components/parameters/LocaleHeader'
-        - name: X-Entitlement-Token
-          in: header
-          required: false
-          schema:
-            type: string
-          description: JWT токен entitlement. Обязателен для premium-категорий. Отсутствие → 401, невалидный/истёкший → 403.
         - name: category_id
           in: path
           required: true
@@ -651,14 +738,8 @@ paths:
                     civilian_word: Elephant
                     impostor_word: null
                     difficulty: easy
-        '401':
-          description: Отсутствует X-Entitlement-Token для premium категории
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '403':
-          description: Токен невалиден или истёк
+          description: Пользователь не имеет premium-подписки
           content:
             application/json:
               schema:
@@ -825,7 +906,7 @@ paths:
         Недоступен обычным пользователям (free и premium).
       tags: [AI]
       security:
-        - BearerAuth: []
+        - AdminApiKeyAuth: []
       requestBody:
         required: true
         content:
@@ -912,7 +993,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
-          description: Отсутствует или невалидный Bearer токен
+          description: Отсутствует или невалидный X-Admin-Api-Key
           content:
             application/json:
               schema:
@@ -1049,92 +1130,266 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
-  /purchase/validate:
+  /users:
     post:
-      summary: Валидация Apple IAP транзакции
+      summary: Создание пользователя
       description: |
-        Верифицирует Apple IAP транзакцию через Apple App Store Server API.
-        Возвращает entitlement_token — JWT (RS256) для авторизации последующих
-        premium-запросов без повторного обращения к Apple.
-
-        Если backend недоступен (503), клиент применяет Grace Period 7 дней.
-      tags: [Purchase]
-      parameters:
-        - $ref: '#/components/parameters/DeviceId'
-        - $ref: '#/components/parameters/AppVersion'
-        - $ref: '#/components/parameters/LocaleHeader'
+        Регистрирует нового пользователя по device_id и сразу возвращает профиль + JWT access_token.
+        Если пользователь с таким device_id уже существует — возвращает существующий профиль (idempotent).
+        Не требует X-Api-Key — вызывается при первом запуске до получения токена.
+      tags: [User]
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [transaction_id, receipt_data, product_id]
-              properties:
-                transaction_id:
-                  type: string
-                  example: "..."
-                receipt_data:
-                  type: string
-                  example: "..."
-                product_id:
-                  type: string
-                  example: com.imposterai.premium.monthly
+              $ref: '#/components/schemas/CreateUserRequest'
       responses:
         '200':
-          description: Результат валидации (valid или invalid)
+          description: Профиль существующего пользователя (upsert — пользователь уже был создан ранее)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UserProfile'
+                  - type: object
+                    required: [access_token, token_type]
+                    properties:
+                      access_token:
+                        type: string
+                        description: JWT Bearer токен
+                        example: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+                      token_type:
+                        type: string
+                        enum: [bearer]
+                        example: bearer
+        '201':
+          description: Профиль нового пользователя
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UserProfile'
+                  - type: object
+                    required: [access_token, token_type]
+                    properties:
+                      access_token:
+                        type: string
+                        description: JWT Bearer токен
+                        example: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+                      token_type:
+                        type: string
+                        enum: [bearer]
+                        example: bearer
+              example:
+                id: "550e8400-e29b-41d4-a716-446655440100"
+                device_id: "550e8400-e29b-41d4-a716-446655440099"
+                tokens: 0
+                is_premium: false
+                premium_expires_at: null
+                created_at: "2026-06-09T10:00:00Z"
+                access_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+                token_type: bearer
+        '400':
+          description: Невалидный device_id (не UUID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            Возвращается если передан явный конфликт. В стандартном сценарии (upsert по device_id) операция idempotent — 409 не возвращается, вместо этого приходит 200 с существующим профилем.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me:
+    get:
+      summary: Профиль текущего пользователя
+      description: |
+        Возвращает профиль пользователя идентифицированного по X-Device-Id.
+        Требует стандартный X-Api-Key + X-Device-Id header.
+        Идентификация пользователя происходит через X-Device-Id.
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Профиль пользователя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              example:
+                id: "550e8400-e29b-41d4-a716-446655440100"
+                device_id: "550e8400-e29b-41d4-a716-446655440099"
+                tokens: 15
+                is_premium: true
+                premium_expires_at: "2026-07-09T10:00:00Z"
+                created_at: "2026-06-09T10:00:00Z"
+        '401':
+          description: Отсутствует или невалидный X-Api-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Пользователь с таким device_id не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /webhooks/adapty:
+    post:
+      summary: Adapty webhook — обработка событий подписки
+      description: |
+        Принимает webhook-события от Adapty.
+        Верификация осуществляется через заголовок `Adapty-Signature` — стандартный `X-Api-Key` не используется.
+
+        При получении события об активации/продлении подписки:
+        - Находит пользователя по `customer_user_id` из payload (= device_id пользователя).
+        - Обновляет профиль: устанавливает `is_premium = true`, обновляет `premium_expires_at`.
+
+        Возвращает `200 OK` для любого корректно подписанного запроса, включая неизвестные типы событий
+        (необходимо для корректной работы retry-механизма Adapty).
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - name: Adapty-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: HMAC-подпись от Adapty для верификации источника webhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdaptyWebhookPayload'
+      responses:
+        '200':
+          description: Webhook успешно обработан
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  is_valid:
-                    type: boolean
-                  product_id:
+                  status:
                     type: string
-                    nullable: true
-                  expires_at:
-                    type: string
-                    format: date-time
-                    nullable: true
-                  environment:
-                    type: string
-                    nullable: true
-                    enum: [production, sandbox]
-                  entitlement_token:
-                    type: string
-                    nullable: true
-                  reason:
-                    type: string
-                    nullable: true
-              examples:
-                valid:
-                  summary: Валидная транзакция
-                  value:
-                    is_valid: true
-                    product_id: com.imposterai.premium.monthly
-                    expires_at: "2026-07-06T12:00:00Z"
-                    environment: production
-                    entitlement_token: "<signed_jwt>"
-                invalid:
-                  summary: Невалидная транзакция
-                  value:
-                    is_valid: false
-                    reason: receipt_expired
+                    example: ok
         '400':
-          description: Невалидные поля запроса
+          description: Невалидный payload
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '503':
-          description: Apple API временно недоступен
+        '401':
+          description: Невалидная или отсутствующая Adapty-Signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка обработки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/users/tokens:
+    post:
+      summary: Пополнение токенов пользователю (admin)
+      description: |
+        Начисляет указанное количество токенов пользователю, найденному по `device_id`.
+
+        Доступен только с X-Admin-Api-Key. Стандартный X-Api-Key не требуется.
+      tags: [Admin]
+      security:
+        - AdminApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddTokensRequest'
+      responses:
+        '200':
+          description: Профиль пользователя с обновлённым балансом токенов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              example:
+                id: "550e8400-e29b-41d4-a716-446655440100"
+                device_id: "550e8400-e29b-41d4-a716-446655440099"
+                tokens: 65
+                is_premium: true
+                premium_expires_at: "2026-07-09T10:00:00Z"
+                created_at: "2026-06-09T10:00:00Z"
+        '400':
+          description: Невалидный запрос — не указан device_id или tokens_amount <= 0
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Отсутствует или невалидный X-Admin-Api-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Пользователь не найден по указанным идентификаторам
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Внутренняя ошибка
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
 
 tags:
+  - name: User
+    description: |
+      Управление пользователями и аутентификация.
+
+      Флоу первого запуска: `POST /users` (регистрация по device_id, сразу возвращает профиль + JWT) → `GET /users/me` (чтение профиля).
+      `POST /users` не требует X-Api-Key — вызывается до получения токена.
+      Профиль содержит баланс токенов, статус и дату истечения premium-подписки.
+  - name: Webhooks
+    description: |
+      Входящие webhook-события от внешних сервисов.
+
+      `POST /webhooks/adapty` — обработка событий подписок от Adapty (замена Apple IAP логики).
+      Верификация через `Adapty-Signature` header, стандартный X-Api-Key не используется.
+      Начисляет entitlement пользователю по customer_user_id из payload (= device_id пользователя).
+  - name: Admin
+    description: |
+      Административные эндпоинты для управления пользователями и контентом.
+
+      Все `/admin/*` эндпоинты требуют `X-Admin-Api-Key` в дополнение к стандартным заголовкам.
+      Никогда не вызываются из мобильного приложения — только из доверенных admin-инструментов.
+      `POST /admin/users/tokens` — ручное пополнение токенов пользователям (поддержка, акции, компенсации).
   - name: Categories
     description: |
       Категории и слова.
@@ -1153,13 +1408,6 @@ tags:
 
       Оба эндпоинта вызываются при каждом cold start параллельно.
       Ответы кешируются локально. При недоступности сервера клиент использует last known good.
-  - name: Purchase
-    description: |
-      Валидация покупок и premium-доступ.
-
-      Вызывается после успешной транзакции в StoreKit 2. Возвращает `entitlement_token` (JWT RS256),
-      который клиент хранит в Keychain и передаёт в `X-Entitlement-Token` при запросе premium-контента.
-      Обновляется при cold start если до истечения токена < 7 дней.
   - name: Game Flow
     description: |
       Справочный раздел — полный флоу запуска игры на iOS описан в разделе
