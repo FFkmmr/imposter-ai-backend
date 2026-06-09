@@ -131,15 +131,18 @@ async def generate_theme(
     if not allowed:
         fallback = await _get_fallback_word(db, body.locale, body.mode)
         await _log(db, device_id, body.locale, sanitized, body.mode, False, True, "rate_limit_exceeded")
-        return {
-            "locale": body.locale,
-            "topic": sanitized,
-            **fallback,
-            "difficulty": "easy",
-            "is_safe": True,
-            "fallback_used": True,
-            "fallback_reason": "rate_limit_exceeded",
-        }
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "locale": body.locale,
+                "topic": sanitized,
+                **fallback,
+                "difficulty": "easy",
+                "is_safe": True,
+                "fallback_used": True,
+                "fallback_reason": "rate_limit_exceeded",
+            },
+        )
 
     if _is_blocked(sanitized):
         fallback = await _get_fallback_word(db, body.locale, body.mode)

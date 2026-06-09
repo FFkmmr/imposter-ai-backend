@@ -124,19 +124,19 @@ async def get_words(
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
 
-    if cat.is_premium:
-        user_result = await db.execute(select(User).where(User.device_id == device_id))
-        user = user_result.scalar_one_or_none()
-        now = datetime.now(timezone.utc)
-        premium_active = (
-            user is not None
-            and user.is_premium
-            and (user.premium_expires_at is None or user.premium_expires_at > now)
-        )
-        if not premium_active:
-            raise HTTPException(status_code=403, detail="Premium subscription required")
+    user_result = await db.execute(select(User).where(User.device_id == device_id))
+    user = user_result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    user_is_premium = (
+        user is not None
+        and user.is_premium
+        and (user.premium_expires_at is None or user.premium_expires_at > now)
+    )
 
-    key, limit = await get_words_limit_key(device_id)
+    if cat.is_premium and not user_is_premium:
+        raise HTTPException(status_code=403, detail="Premium subscription required")
+
+    key, limit = await get_words_limit_key(device_id, is_premium=user_is_premium)
     allowed, rl_limit, remaining, reset_ts = await check_rate_limit(key, limit)
 
     response.headers["X-RateLimit-Limit"] = str(rl_limit)
