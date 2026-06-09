@@ -1167,3 +1167,77 @@ tags:
 
       Игра полностью локальная. Сервер не вызывается в ходе игрового процесса —
       только при старте (cold start), выборе категории, старте раунда и покупке.
+  - name: Seed Words
+    description: |
+      ## База начальных слов (Seed Words)
+
+      Готовая база слов для наполнения free-категорий и первых запросов новых пользователей.
+      Содержит **10 категорий × 20 слов** с локализацией `en` / `ru` и парами для Party Mode (`impostor_word`).
+
+      📥 **[Скачать полный seed_words.json](https://drive.google.com/file/d/1rjQi4PqFWaa9V7T_V053Kgd6rTXwwSls/view?usp=sharing)**
+
+      ---
+
+      ### Структура файла
+
+      ```json
+      {
+        "meta": {
+          "description": "Seed word database for free-tier users. 10 categories, 20 words each.",
+          "locales": ["en", "ru"],
+          "modes": ["standard", "party"]
+        },
+        "categories": [
+          {
+            "slug": "animals",
+            "name": { "en": "Animals", "ru": "Животные" },
+            "is_premium": false,
+            "words": [
+              {
+                "civilian_word": { "en": "Elephant", "ru": "Слон" },
+                "impostor_word": { "en": "Mammoth", "ru": "Мамонт" },
+                "difficulty": "easy"
+              },
+              {
+                "civilian_word": { "en": "Dolphin", "ru": "Дельфин" },
+                "impostor_word": { "en": "Shark", "ru": "Акула" },
+                "difficulty": "easy"
+              },
+              {
+                "civilian_word": { "en": "Eagle", "ru": "Орёл" },
+                "impostor_word": { "en": "Hawk", "ru": "Ястреб" },
+                "difficulty": "medium"
+              }
+            ]
+          },
+          "... (+ 9 категорий, 17 слов в animals и далее — см. полный файл)"
+        ]
+      }
+      ```
+
+      ---
+
+      ### Категории в файле
+
+      | Slug | EN | RU | Слов |
+      |---|---|---|---|
+      | `animals` | Animals | Животные | 20 |
+      | `food` | Food | Еда | 20 |
+      | `sports` | Sports | Спорт | 20 |
+      | `professions` | Professions | Профессии | 20 |
+      | `places` | Places | Места | 20 |
+      | `transport` | Transport | Транспорт | 20 |
+      | `nature` | Nature | Природа | 20 |
+      | `technology` | Technology | Технологии | 20 |
+      | `movies` | Movies & TV | Кино и сериалы | 20 |
+      | `science` | Science | Наука | 20 |
+
+      ---
+
+      ### Поля каждого слова
+
+      | Поле | Тип | Описание |
+      |---|---|---|
+      | `civilian_word` | `{ en, ru }` | Слово для мирных игроков |
+      | `impostor_word` | `{ en, ru }` | Слово для Undercover (Party Mode). Похожее, но отличное от civilian |
+      | `difficulty` | `easy / medium / hard` | Сложность угадывания |
