@@ -28,3 +28,8 @@ async def generic_error_handler(request: Request, exc: Exception):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
