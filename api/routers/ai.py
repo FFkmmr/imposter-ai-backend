@@ -78,20 +78,37 @@ async def _generate_with_llm(topic: str, locale: str, mode: str, count: int = 1)
         f"Example: [{{'civilian_word': 'Mars', 'impostor_word': 'Moon', 'difficulty': 'medium'}}]"
     )
 
+    # max_tokens масштабируем от count: каждый объект {civilian_word, impostor_word,
+    # difficulty} ~40-60 токенов + накладные на массив/обёртку. Пол 400 (для count=1..5),
+    # потолок 4000 (count=30 → ~1800, с запасом). Не ломает generate-theme (count=5 → 400).
+    max_tokens = min(4000, max(400, count * 60))
+
+    # Таймаут тоже зависит от count: base 5s + 0.5s/объект, потолок 25s.
+    # generate-theme (count=5) → 5s (быстро). count=30 → 20s.
+    timeout = min(25.0, 5.0 + count * 0.5)
+
     response = await asyncio.wait_for(
         client.chat.completions.create(
             model=settings.openai_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8,
-            max_tokens=400,
+            max_tokens=max_tokens,
         ),
-        timeout=5.0,
+        timeout=timeout,
     )
 
-    import json
     text = response.choices[0].message.content.strip()
     text = re.sub(r"^```json\s*|^```\s*|```$", "", text, flags=re.MULTILINE).strip()
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.error(
+            "AI LLM: failed to parse JSON response | count=%s | max_tokens=%s | "
+            "raw_response (truncated 500)=%r",
+            count, max_tokens, text[:500],
+            exc_info=True,
+        )
+        raise
 
 
 async def _check_moderation(text: str) -> bool:
@@ -226,7 +243,13 @@ async def generate_theme(
         # свежая LLM-генерация
         try:
             words = await _generate_with_llm(sanitized, body.locale, body.mode, count=5)
-        except Exception:
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.warning(
+                "AI theme: LLM generation failed, using fallback | device_id=%s | topic=%s | "
+                "error=%s: %s",
+                device_id, sanitized, type(exc).__name__, exc,
+                exc_info=True,
+            )
             return await _fallback_response(
                 db, device_id, body.locale, sanitized, body.mode,
                 reason="ai_unavailable", tokens_remaining=balance,
@@ -355,11 +378,15 @@ async def generate_words(body: GenerateWordsRequest, db: AsyncSession = Depends(
 
     try:
         words = await _generate_with_llm(sanitized, body.locale, body.mode, count=body.count)
-    except Exception:
+    except (asyncio.TimeoutError, Exception) as exc:
+        logger.error(
+            "AI words: LLM generation failed | topic=%s | locale=%s | count=%s | error=%s: %s",
+            sanitized, body.locale, body.count, type(exc).__name__, exc,
+            exc_info=True,
+        )
         await _log(db, uuid.UUID(int=0), body.locale, sanitized, body.mode, False, True, "ai_unavailable")
         raise HTTPException(status_code=503, detail="LLM unavailable")
 
-    import json
     safe_words = []
     unsafe_count = 0
     for w in words:
