@@ -19,6 +19,7 @@ async def seed():
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     data = json.loads(SEED_FILE.read_text(encoding="utf-8"))
+    locales = data.get("meta", {}).get("locales") or ["en", "ru"]
 
     async with Session() as db:
         for idx, cat_data in enumerate(data["categories"]):
@@ -44,7 +45,7 @@ async def seed():
                         "id": str(cat_id),
                         "slug": slug,
                         "name": json.dumps(cat_data["name"]),
-                        "desc": json.dumps({}),
+                        "desc": json.dumps(cat_data.get("description", {})),
                         "premium": cat_data.get("is_premium", False),
                         "order": idx,
                     },
@@ -61,7 +62,7 @@ async def seed():
                 continue
 
             for word in cat_data["words"]:
-                for locale in ["en", "ru"]:
+                for locale in locales:
                     civilian = word["civilian_word"].get(locale) or word["civilian_word"].get("en")
                     impostor_raw = word.get("impostor_word")
                     impostor = impostor_raw.get(locale) or impostor_raw.get("en") if impostor_raw else None
@@ -82,7 +83,7 @@ async def seed():
                         },
                     )
 
-            print(f"    + {len(cat_data['words'])} words × 2 locales for '{slug}'")
+            print(f"    + {len(cat_data['words'])} words × {len(locales)} locales for '{slug}'")
 
         await db.commit()
 

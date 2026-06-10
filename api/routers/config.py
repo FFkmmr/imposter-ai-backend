@@ -36,6 +36,26 @@ DEFAULT_LOCALIZATIONS = {
         "paywall.subtitle": "AI-темы, премиум-категории и многое другое",
         "onboarding.step1.title": "Раздаём роли",
     },
+    "es": {
+        "paywall.title": "Desbloquéalo todo",
+        "paywall.subtitle": "Temas con IA, categorías premium y mucho más",
+        "onboarding.step1.title": "Repartimos los roles",
+    },
+    "pt": {
+        "paywall.title": "Desbloqueie tudo",
+        "paywall.subtitle": "Temas com IA, categorias premium e muito mais",
+        "onboarding.step1.title": "Distribuímos os papéis",
+    },
+    "fr": {
+        "paywall.title": "Tout débloquer",
+        "paywall.subtitle": "Thèmes IA, catégories premium et bien plus",
+        "onboarding.step1.title": "On distribue les rôles",
+    },
+    "de": {
+        "paywall.title": "Alles freischalten",
+        "paywall.subtitle": "KI-Themen, Premium-Kategorien und vieles mehr",
+        "onboarding.step1.title": "Wir verteilen die Rollen",
+    },
 }
 
 

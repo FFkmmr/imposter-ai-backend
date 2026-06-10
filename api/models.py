@@ -61,6 +61,20 @@ class FeatureConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class ProcessedWebhookEvent(Base):
+    """Ledger обработанных webhook-событий Adapty — гарантирует идемпотентность
+    начисления токенов. event_id — PK (произвольная строка из payload Adapty,
+    НЕ UUID). Запись создаётся в той же транзакции, что и обновление User."""
+
+    __tablename__ = "processed_webhook_events"
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    customer_user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tokens_granted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class AITopicRequestLog(Base):
     __tablename__ = "ai_topic_request_logs"
 

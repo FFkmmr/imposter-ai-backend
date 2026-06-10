@@ -79,32 +79,32 @@ info:
 
     ## Логика AI-генерации слов
 
-    ### Флоу генерации темы (POST /ai/generate-theme)
-    1. Клиент отправляет: `{ topic, locale, mode }`.
-    2. Сервер очищает prompt: обрезает до 80 символов, убирает спецсимволы.
-    3. Сервер проверяет тему по blacklist (список запрещённых слов/паттернов на regex).
-    4. Если blocked → возвращает `fallback_used: true` + случайный curated word. Клиент получает 200, не ошибку.
-    5. Если прошло → проверяет пул слов для данного `sanitized_prompt + locale`:
-       - Из пула исключаются слова уже выданные этому `device_id`.
-       - Если остались доступные слова → выдаётся одно случайное из них.
-       - Если все слова пула исчерпаны → переходим к шагу 6.
-    6. Если нет доступных слов → формирует системный промпт для LLM (язык, режим, guardrails).
-    7. Вызов LLM. Таймаут: 5 секунд.
-    8. Парсинг и валидация ответа LLM.
-    9. Post-generation проверка через OpenAI Moderation API.
-    10. Новые слова добавляются в пул. Выдаётся одно случайное из только что полученных новых слов.
-    11. Логирование в AITopicRequestLog.
-    12. Возврат клиенту.
+    ### Флоу генерации темы (POST /ai/generate-theme) — premium-only, ADR-003
+    Нормативный порядок (см. backend_spec.md §3 / ADR-003 §6):
+    1. Клиент отправляет: `{ topic, locale, mode }`. Сервер очищает prompt (≤80 символов, спецсимволы).
+    2. Premium-gating: не premium → fallback `premium_required` (HTTP 200), токены не трогаются.
+    3. Rate-limit (premium 50/24h): превышение → fallback `rate_limit_exceeded` (**HTTP 200**, НЕ 429).
+    4. Blacklist/модерация темы → fallback `moderation_rejected` (HTTP 200).
+    5. Проверка баланса: `tokens < AI_THEME_TOKEN_COST` → fallback `insufficient_tokens` (HTTP 200).
+    6. Подбор AI-слова-кандидата: Redis pool-cache (неотданное устройству слово) ИЛИ свежая LLM-генерация
+       (таймаут 5 сек; LLM недоступен → `ai_unavailable`; post-moderation unsafe → `moderation_rejected`).
+       На этом шаге слово ещё НЕ фиксируется в device-историю.
+    7. Атомарное списание `AI_THEME_TOKEN_COST` (conditional decrement, проверка rowcount) — ДО фиксации
+       выдачи. rowcount = 0 (гонка) → fallback `insufficient_tokens`, история не меняется.
+    8. ТОЛЬКО при rowcount = 1: фиксация выдачи (`sadd device_history`) + возврат AI-слова.
+    9. Логирование в AITopicRequestLog + ответ с `tokens_remaining`.
 
     ### Логика пула слов
     - Пул хранится в Redis с ключом `topic_pool:{sanitized_prompt}:{locale}`. Без TTL — накапливается со временем.
     - История выданных слов хранится на сервере: ключ `device_history:{device_id}:{sanitized_prompt}:{locale}`. TTL: 30 дней.
     - При каждом запросе сервер сам исключает из пула слова уже выданные этому устройству — клиент ничего дополнительно не передаёт.
 
-    ### Fallback-цепочка
-    - LLM timeout (5 сек) → случайный word из категории с похожими тегами.
-    - Moderation rejected → curated fallback из default категории.
-    - Rate limit exceeded → curated fallback из default категории.
+    ### Fallback-цепочка (все — HTTP 200, fallback_used: true, токены НЕ списываются)
+    - `premium_required` → не-premium, AI не вызывается (клиент показывает paywall).
+    - `rate_limit_exceeded` → превышен premium-потолок 50/24h (HTTP 200, НЕ 429).
+    - `moderation_rejected` → тема в blacklist или ответ LLM не прошёл модерацию.
+    - `insufficient_tokens` → premium, баланс < AI_THEME_TOKEN_COST (в т.ч. гонка decrement).
+    - `ai_unavailable` → LLM timeout (5 сек) / ошибка.
     - `500` только если вообще нет контента для fallback (не должно происходить в production).
 
     ### Флоу генерации слов по теме (POST /ai/generate-words)
@@ -114,11 +114,32 @@ info:
 
     ---
 
-    ## Логика premium / paywall
+    ## Логика premium / paywall (токеномика — вариант Б)
 
-    Premium-статус управляется через Adapty. После успешной покупки в StoreKit 2 Adapty
-    автоматически отправляет webhook на `POST /webhooks/adapty` — сервер обновляет `is_premium`
-    и `premium_expires_at` в профиле пользователя. Клиент читает актуальный статус через `GET /users/me`.
+    Premium-статус управляется через Adapty (см. ADR-001 — Apple App Store Server API и `POST /purchase/validate`
+    не используются; см. ADR-002 — переход на bearer-авторизацию webhook и реальную токеномику). После успешной
+    покупки в StoreKit 2 + Adapty SDK Adapty отправляет webhook на `POST /billing/adapty/webhook`.
+
+    **Авторизация webhook — bearer-token, не HMAC.** Adapty НЕ подписывает payload. Сервер сверяет заголовок
+    `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>` со статическим секретом из env (constant-time). Неверный/
+    отсутствующий токен → `401`. Не задан `ADAPTY_WEBHOOK_SECRET` на сервере → `500`. Путь исключён из глобальной
+    `X-Api-Key` защиты.
+
+    **Эффект события (токеномика вариант Б):**
+    - `subscription_started` / `subscription_renewed` → `is_premium = true` + начисление токенов по тиру продукта;
+    - `subscription_cancelled` / `subscription_expired` → `is_premium = false`, токены НЕ трогаем.
+
+    `expires_at` (если прислан) → `premium_expires_at`. `customer_user_id` = `User.device_id` (UUID).
+
+    **Идемпотентность.** Перед начислением сервер проверяет `event_id` в ledger обработанных событий
+    (`ProcessedWebhookEvent`). Повтор → `200 {"status":"duplicate"}` без повторного начисления. Обновление баланса +
+    запись факта обработки выполняются в одной транзакции.
+
+    **Толерантность к payload.** После успешной авторизации ЛЮБОЙ некорректный/пробный payload → `200`
+    `{"status":"ignored", ...}` (не 4xx/5xx). `5xx` только при реальном внутреннем сбое (БД недоступна) — Adapty
+    ретраит любой не-2xx бесконечно. Premium-gating premium-эндпоинтов выполняется по флагу `User.is_premium`
+    (lookup по `X-Device-Id`); отдельного entitlement-токена нет. Клиент читает актуальный статус через
+    `GET /users/me`.
 
     ---
 
@@ -151,8 +172,8 @@ info:
 
     - Rate limit по `device_id` (anonymous), не по IP.
     - Окно: rolling 24 hours (не сброс в midnight UTC). Хранилище: Redis.
-    - При превышении → ответ `429` с телом (`fallback_used: true` + curated слово) — клиент обрабатывает как успех.
-    - Заголовки в ответе: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (Unix timestamp).
+    - При превышении на `POST /ai/generate-theme` → **HTTP 200** + curated fallback (`fallback_used: true`, `fallback_reason: rate_limit_exceeded`) — тихий fallback, эндпоинт НИКОГДА не отдаёт 429 (ADR-003). Прочие rate-limited эндпоинты могут отдавать `429`.
+    - Заголовки в ответе: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (Unix timestamp) — присутствуют и в fallback-ответе.
 
     ---
 
@@ -309,8 +330,10 @@ info:
     Хранится только на стороне сервера и доверенных admin-клиентов. Никогда не передаётся в мобильное приложение.
 
     ### Webhooks
-    Эндпоинты `/webhooks/*` не используют стандартный `X-Api-Key`.
-    Верификация осуществляется через payload-специфичные заголовки (например, `Adapty-Signature` для Adapty).
+    Эндпоинт `/billing/adapty/webhook` не использует стандартный `X-Api-Key` (Adapty не знает service key) и
+    исключён из глобальной `X-Api-Key` защиты. Авторизация — bearer-token: заголовок
+    `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>`, сверяется со статическим секретом из env (constant-time).
+    Adapty НЕ подписывает payload — HMAC `Adapty-Signature` больше не используется (см. ADR-002).
 
     ---
 
@@ -330,6 +353,13 @@ components:
       type: apiKey
       in: header
       name: X-Admin-Api-Key
+    AdaptyWebhookBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Статический секрет `ADAPTY_WEBHOOK_SECRET` из env, передаётся как
+        `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>`. Adapty не подписывает payload —
+        это не JWT, а shared secret. Сравнение constant-time.
 
   parameters:
     DeviceId:
@@ -491,39 +521,118 @@ components:
 
     AdaptyWebhookPayload:
       type: object
-      required: [event_type, profile_id]
+      description: |
+        Payload события Adapty. Поля разбросаны по версиям SDK — сервер парсит дефенсивно с приоритетом:
+        - `event_id` = `event_id` || `id`
+        - `event_type` = `event_type` (приводится к lowercase)
+        - `customer_user_id` = `customer_user_id` || `profile.customer_user_id` || `user_id`
+        - `vendor_product_id` = `event_properties.vendor_product_id` || `event_properties.product_id` ||
+          `vendor_product_id` || `product_id`
+        - `expires_at` = `event_properties.expires_at` || `profile.expires_at`
+        Любые поля, которые не удалось извлечь, не приводят к ошибке — payload игнорируется с `200 ignored`.
       properties:
+        event_id:
+          type: string
+          description: Уникальный ID события (для идемпотентности). Альтернатива — поле `id`.
+          example: evt_8f3a1c
+        id:
+          type: string
+          description: Альтернативное имя поля `event_id` в части версий SDK.
         event_type:
           type: string
-          example: subscription_renewed
-          description: Тип события Adapty
-        profile_id:
-          type: string
-          description: Внутренний ID профиля Adapty
+          enum: [subscription_started, subscription_renewed, subscription_cancelled, subscription_expired]
+          example: subscription_started
+          description: Тип события Adapty (сравнивается в lowercase). Неизвестный тип → 200 ignored.
         customer_user_id:
           type: string
-          nullable: true
-          description: |
-            customer_user_id в Adapty — равен device_id пользователя.
-            По этому полю сервер находит пользователя при обработке события.
-        paid_access_level:
+          description: Равен `User.device_id` (UUID). Может также прийти в `profile.customer_user_id` или `user_id`.
+          example: "550e8400-e29b-41d4-a716-446655440099"
+        user_id:
+          type: string
+          description: Альтернативное имя `customer_user_id`.
+        vendor_product_id:
+          type: string
+          description: SKU продукта. Определяет тир начисления токенов. Также извлекается из `event_properties`.
+          example: sub_yearly
+        product_id:
+          type: string
+          description: Альтернативное имя `vendor_product_id`.
+        event_properties:
           type: object
-          nullable: true
-          description: Данные уровня доступа (premium entitlement)
+          description: Вложенные свойства события (приоритетный источник vendor_product_id/expires_at).
           properties:
-            id:
+            vendor_product_id:
               type: string
-              example: premium
-            is_active:
-              type: boolean
+            product_id:
+              type: string
             expires_at:
               type: string
               format: date-time
               nullable: true
-        additionalProperties: true
+          additionalProperties: true
+        profile:
+          type: object
+          description: Профиль Adapty (альтернативный источник customer_user_id/expires_at).
+          properties:
+            customer_user_id:
+              type: string
+            expires_at:
+              type: string
+              format: date-time
+              nullable: true
+          additionalProperties: true
+      additionalProperties: true
+
+    WebhookIgnoredResponse:
+      type: object
+      description: |
+        Payload не прошёл дефенсивную валидацию или не требует обработки. Всегда HTTP 200 — Adapty
+        не должен ретраить корректно принятый, но проигнорированный запрос.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ignored]
+        reason:
+          type: string
+          description: Причина игнорирования (для пробных пингов и кривых payload).
+          enum: [empty_body, invalid_json, not_an_object, missing_event_id, missing_customer_user_id]
+        event_type:
+          type: string
+          description: Заполняется, когда причина — неизвестный event_type.
+
+    WebhookAppliedResponse:
+      type: object
+      description: Валидное событие обработано, баланс/флаг обновлены, факт записан в ledger.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [applied]
+        event_type:
+          type: string
+          example: subscription_started
+        tokens_granted:
+          type: integer
+          description: Сколько токенов начислено (0 для cancelled/expired).
+          example: 200
+
+    WebhookDuplicateResponse:
+      type: object
+      description: event_id уже обработан ранее — повторное начисление не выполняется.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [duplicate]
 
     AIThemeResponse:
       type: object
+      description: |
+        Ответ AI-генерации темы. Эндпоинт **premium-only** (ADR-003): AI-слово выдаётся
+        только premium-пользователю с достаточным балансом токенов. Free-юзер, недостаток
+        токенов, превышение rate-limit или модерация → curated fallback (`fallback_used: true`)
+        с соответствующим `fallback_reason`. Контракт ответа единый для AI и fallback.
       properties:
         locale:
           type: string
@@ -548,7 +657,27 @@ components:
         fallback_reason:
           type: string
           nullable: true
-          enum: [ai_unavailable, moderation_rejected, rate_limit_exceeded]
+          description: |
+            Причина fallback (только при fallback_used: true; иначе null):
+            - premium_required — пользователь не premium, AI недоступен (показать paywall);
+            - insufficient_tokens — premium, но баланс < AI_THEME_TOKEN_COST;
+            - rate_limit_exceeded — превышен анти-абуз потолок (premium 50/24h);
+            - moderation_rejected — тема заблокирована blacklist/модерацией;
+            - ai_unavailable — LLM недоступен/таймаут.
+          enum: [ai_unavailable, moderation_rejected, rate_limit_exceeded, premium_required, insufficient_tokens]
+        tokens_remaining:
+          type: integer
+          nullable: true
+          description: |
+            Баланс токенов пользователя после обработки запроса. При успешной выдаче AI-слова —
+            баланс уже за вычетом AI_THEME_TOKEN_COST. При fallback токены не списываются:
+            для premium возвращается текущий баланс, для не-premium/неизвестного устройства — null.
+
+            Premium-fallback'и (insufficient_tokens, rate_limit_exceeded, moderation_rejected,
+            ai_unavailable) достижимы ТОЛЬКО для premium (free отсекается раньше на premium-gating),
+            поэтому в них tokens_remaining ВСЕГДА несёт текущий баланс (int, не null). null —
+            исключительно для premium_required (не-premium/неизвестное устройство).
+          example: 199
 
 paths:
   /categories:
@@ -760,16 +889,46 @@ paths:
 
   /ai/generate-theme:
     post:
-      summary: Генерация слова по теме
+      summary: Генерация слова по теме (premium-only, списание токенов)
       description: |
-        Генерирует слово или пару слов по пользовательской теме через LLM.
+        Генерирует слово или пару слов по пользовательской теме через LLM. **Premium-only фича**
+        со списанием токенов (ADR-003).
+
+        **Premium-gating:** AI-генерация доступна только premium-пользователю (`User.is_premium == true`
+        и подписка не истекла). Free-юзер получает curated fallback с `fallback_reason: premium_required`
+        (HTTP 200) — клиент по этому reason показывает paywall.
+
+        **Списание токенов:** одна фактическая выдача AI-слова (свежая LLM-генерация ИЛИ отдача из
+        Redis pool-cache) стоит `AI_THEME_TOKEN_COST` (env, default 1). Списание — атомарный
+        conditional decrement на уровне строки User (`UPDATE users SET tokens = tokens - cost
+        WHERE id = :id AND tokens >= cost`, проверка rowcount); при rowcount = 0 → fallback
+        `insufficient_tokens`. На ЛЮБОЙ fallback токены НЕ списываются. `tokens_remaining` в ответе —
+        баланс после обработки.
+
+        **Порядок проверок (ADR-003 §6):** авторизация (X-Api-Key) → premium-gating (нет premium →
+        premium_required) → rate-limit (превышение → rate_limit_exceeded) → blacklist/модерация
+        (→ moderation_rejected) → проверка баланса (недостаточно → insufficient_tokens) → подбор
+        AI-слова-кандидата (cache/fresh) → атомарное списание AI_THEME_TOKEN_COST (decrement ПЕРЕД
+        фиксацией выдачи; rowcount = 0 → insufficient_tokens) → фиксация выдачи в device-историю
+        ТОЛЬКО при rowcount = 1 → лог.
 
         **Логика пула слов:** сервер хранит историю выданных слов по device_id с TTL 30 дней.
         При повторном запросе той же темы выдаётся слово которое устройство ещё не получало.
-        Если все слова исчерпаны — LLM генерирует новые и добавляет в пул.
+        Если все слова исчерпаны — LLM генерирует новые и добавляет в пул. Выдача из pool-cache
+        premium-пользователю также тарифицируется (списывается AI_THEME_TOKEN_COST).
 
-        **Fallback:** при недоступности LLM, превышении rate limit или отклонении модерацией
-        возвращается curated слово с fallback_used: true. Клиент обрабатывает как успех.
+        **Rate-limit** сохраняется как анти-абуз потолок для premium (50/24h) поверх токеномики.
+        Превышение rate-limit → **HTTP 200** + curated fallback (`fallback_reason: rate_limit_exceeded`),
+        НЕ HTTP 429. Заголовки `X-RateLimit-*` при этом присутствуют в ответе.
+
+        **Единый принцип (ADR-003):** этот эндпоинт **НИКОГДА не возвращает 429** и не возвращает
+        hard-error за нехватку токенов/премиума/rate-limit. ВСЕ случаи нехватки (premium_required,
+        insufficient_tokens, rate_limit_exceeded, moderation_rejected, ai_unavailable) — «тихий
+        fallback» HTTP 200 + curated слово + `fallback_reason`. Клиент обрабатывает как успех.
+
+        **Fallback:** при недоступности LLM, превышении rate limit, отклонении модерацией,
+        отсутствии premium или недостатке токенов возвращается curated слово с fallback_used: true.
+        Клиент обрабатывает как успех.
       tags: [AI]
       parameters:
         - $ref: '#/components/parameters/DeviceId'
@@ -800,7 +959,8 @@ paths:
       responses:
         '200':
           description: |
-            Успешный ответ. Включает fallback-случаи (fallback_used: true).
+            Успешный ответ. Включает ВСЕ fallback-случаи (fallback_used: true), в т.ч.
+            rate_limit_exceeded — этот эндпоинт не возвращает 429 (ADR-003).
           headers:
             X-RateLimit-Limit:
               schema:
@@ -820,7 +980,7 @@ paths:
                 $ref: '#/components/schemas/AIThemeResponse'
               examples:
                 standard:
-                  summary: Стандартный режим
+                  summary: Стандартный режим (premium, токен списан)
                   value:
                     locale: ru
                     topic: космос
@@ -829,8 +989,10 @@ paths:
                     difficulty: medium
                     is_safe: true
                     fallback_used: false
+                    fallback_reason: null
+                    tokens_remaining: 199
                 party:
-                  summary: Party mode
+                  summary: Party mode (premium, токен списан)
                   value:
                     locale: ru
                     topic: космос
@@ -839,8 +1001,34 @@ paths:
                     difficulty: medium
                     is_safe: true
                     fallback_used: false
-                fallback:
-                  summary: Fallback ответ
+                    fallback_reason: null
+                    tokens_remaining: 199
+                fallback_premium_required:
+                  summary: Free-юзер — premium-only фича (показать paywall)
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Земля
+                    impostor_word: null
+                    difficulty: easy
+                    is_safe: true
+                    fallback_used: true
+                    fallback_reason: premium_required
+                    tokens_remaining: null
+                fallback_insufficient_tokens:
+                  summary: Premium, но баланс < AI_THEME_TOKEN_COST
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Земля
+                    impostor_word: null
+                    difficulty: easy
+                    is_safe: true
+                    fallback_used: true
+                    fallback_reason: insufficient_tokens
+                    tokens_remaining: 0
+                fallback_ai_unavailable:
+                  summary: LLM недоступен (premium, токены не списаны)
                   value:
                     locale: ru
                     topic: космос
@@ -850,40 +1038,37 @@ paths:
                     is_safe: true
                     fallback_used: true
                     fallback_reason: ai_unavailable
+                    tokens_remaining: 200
+                fallback_rate_limit_exceeded:
+                  summary: Premium, превышен анти-абуз потолок 50/24h (токены не списаны, HTTP 200)
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Земля
+                    impostor_word: null
+                    difficulty: easy
+                    is_safe: true
+                    fallback_used: true
+                    fallback_reason: rate_limit_exceeded
+                    tokens_remaining: 200
+                fallback_moderation_rejected:
+                  summary: Premium, тема заблокирована blacklist/модерацией (токены не списаны)
+                  value:
+                    locale: ru
+                    topic: космос
+                    civilian_word: Земля
+                    impostor_word: null
+                    difficulty: easy
+                    is_safe: true
+                    fallback_used: true
+                    fallback_reason: moderation_rejected
+                    tokens_remaining: 200
         '400':
           description: topic пустой или превышает 80 символов
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '429':
-          description: |
-            Превышен rate limit. Тело содержит fallback_used: true + curated слово.
-            Клиент обрабатывает как успех, не как ошибку.
-          headers:
-            X-RateLimit-Limit:
-              schema:
-                type: integer
-            X-RateLimit-Remaining:
-              schema:
-                type: integer
-                example: 0
-            X-RateLimit-Reset:
-              schema:
-                type: integer
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AIThemeResponse'
-              example:
-                locale: ru
-                topic: космос
-                civilian_word: Земля
-                impostor_word: null
-                difficulty: easy
-                is_safe: true
-                fallback_used: true
-                fallback_reason: rate_limit_exceeded
         '500':
           description: Внутренняя ошибка (только если нет контента для fallback)
           content:
@@ -1255,28 +1440,32 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
-  /webhooks/adapty:
+  /billing/adapty/webhook:
     post:
-      summary: Adapty webhook — обработка событий подписки
+      summary: Adapty webhook — подписки и начисление токенов (вариант Б)
       description: |
-        Принимает webhook-события от Adapty.
-        Верификация осуществляется через заголовок `Adapty-Signature` — стандартный `X-Api-Key` не используется.
+        Принимает webhook-события подписок от Adapty. Единственный механизм активации/деактивации premium и
+        начисления токенов за подписку на сервере (см. ADR-001, ADR-002). Полный путь с учётом server url —
+        `POST /v1/billing/adapty/webhook`.
 
-        При получении события об активации/продлении подписки:
-        - Находит пользователя по `customer_user_id` из payload (= device_id пользователя).
-        - Обновляет профиль: устанавливает `is_premium = true`, обновляет `premium_expires_at`.
+        **Авторизация — bearer-token, не HMAC.** Заголовок `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>`,
+        сверяется со статическим секретом из env (constant-time). Adapty не подписывает payload. Путь исключён
+        из глобальной `X-Api-Key` защиты.
 
-        Возвращает `200 OK` для любого корректно подписанного запроса, включая неизвестные типы событий
-        (необходимо для корректной работы retry-механизма Adapty).
+        **Поведение по статусам:**
+        - Неверный/отсутствующий bearer → `401`.
+        - `ADAPTY_WEBHOOK_SECRET` не задан на сервере → `500` (понятный текст ошибки).
+        - После успешной авторизации любой некорректный/пробный payload → `200 {"status":"ignored", ...}`.
+        - Валидное событие → обработка → `200 {"status":"applied", ...}`.
+        - Повтор `event_id` → `200 {"status":"duplicate"}`.
+        - `5xx` только при реальном внутреннем сбое (например, БД недоступна) — Adapty ретраит любой не-2xx.
+
+        **Эффект событий:** `subscription_started`/`subscription_renewed` → `is_premium=true` + начисление токенов
+        по тиру `vendor_product_id`; `subscription_cancelled`/`subscription_expired` → `is_premium=false`, токены
+        не трогаются. `expires_at` → `premium_expires_at`.
       tags: [Webhooks]
-      security: []
-      parameters:
-        - name: Adapty-Signature
-          in: header
-          required: true
-          schema:
-            type: string
-          description: HMAC-подпись от Adapty для верификации источника webhook
+      security:
+        - AdaptyWebhookBearer: []
       requestBody:
         required: true
         content:
@@ -1285,29 +1474,52 @@ paths:
               $ref: '#/components/schemas/AdaptyWebhookPayload'
       responses:
         '200':
-          description: Webhook успешно обработан
+          description: |
+            Запрос авторизован и принят. Тело различает три исхода: `ignored` (кривой/пробный payload),
+            `applied` (событие обработано), `duplicate` (event_id уже обработан).
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: ok
-        '400':
-          description: Невалидный payload
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+                oneOf:
+                  - $ref: '#/components/schemas/WebhookAppliedResponse'
+                  - $ref: '#/components/schemas/WebhookDuplicateResponse'
+                  - $ref: '#/components/schemas/WebhookIgnoredResponse'
+              examples:
+                applied:
+                  summary: Валидное событие обработано
+                  value:
+                    status: applied
+                    event_type: subscription_started
+                    tokens_granted: 200
+                duplicate:
+                  summary: Повтор event_id
+                  value:
+                    status: duplicate
+                ignored_unknown_event:
+                  summary: Неизвестный event_type
+                  value:
+                    status: ignored
+                    event_type: subscription_paused
+                ignored_missing_event_id:
+                  summary: Нет event_id
+                  value:
+                    status: ignored
+                    reason: missing_event_id
+                ignored_invalid_json:
+                  summary: Невалидный JSON
+                  value:
+                    status: ignored
+                    reason: invalid_json
         '401':
-          description: Невалидная или отсутствующая Adapty-Signature
+          description: Отсутствует или неверный bearer-токен (`Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>`)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Внутренняя ошибка обработки
+          description: |
+            `ADAPTY_WEBHOOK_SECRET` не сконфигурирован на сервере, либо реальный внутренний сбой
+            (например, БД недоступна).
           content:
             application/json:
               schema:
@@ -1380,9 +1592,13 @@ tags:
     description: |
       Входящие webhook-события от внешних сервисов.
 
-      `POST /webhooks/adapty` — обработка событий подписок от Adapty (замена Apple IAP логики).
-      Верификация через `Adapty-Signature` header, стандартный X-Api-Key не используется.
-      Начисляет entitlement пользователю по customer_user_id из payload (= device_id пользователя).
+      `POST /billing/adapty/webhook` (полный путь `/v1/billing/adapty/webhook`) — обработка событий подписок от
+      Adapty и начисление токенов за подписку. Единственный механизм активации/деактивации premium на сервере;
+      Apple App Store Server API и `POST /purchase/validate` не используются (см. ADR-001).
+      Авторизация — bearer-token `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>` (constant-time, не HMAC, см. ADR-002),
+      стандартный X-Api-Key не используется и путь исключён из глобальной X-Api-Key защиты.
+      Обновляет `User.is_premium`/`premium_expires_at` и баланс токенов по `customer_user_id` (= device_id).
+      Идемпотентность — через ledger `ProcessedWebhookEvent` по `event_id`.
   - name: Admin
     description: |
       Административные эндпоинты для управления пользователями и контентом.
@@ -1419,73 +1635,59 @@ tags:
     description: |
       ## База начальных слов (Seed Words)
 
-      Готовая база слов для наполнения free-категорий и первых запросов новых пользователей.
-      Содержит **10 категорий × 20 слов** с локализацией `en` / `ru` и парами для Party Mode (`impostor_word`).
+      Готовая база слов для наполнения категорий при старте контейнера (idempotent seed, `api/seed.py`).
 
-      📥 **[Скачать полный seed_words.json](https://drive.google.com/file/d/1rjQi4PqFWaa9V7T_V053Kgd6rTXwwSls/view?usp=sharing)**
+      ### Источник и загрузка
+      - **Источник истины:** `docs/seed_words.json`.
+      - В Docker этот файл монтируется в контейнер как `/app/seed_words.json` (см. `docker-compose.yml`:
+        `./docs/seed_words.json:/app/seed_words.json:ro`). Файл `api/seed_words.json` в репозитории — пустая заглушка;
+        реально используется docs-версия через volume-mount. При запуске без Docker `api/seed.py` читает
+        `seed_words.json` из директории `api/` — в этом сценарии файл должен быть синхронизирован вручную.
+      - `api/seed.py` идемпотентен: пропускает категории/слова, которые уже есть в БД (lookup по `slug` и по наличию word_packs).
 
-      ---
+      ### Контент-контракт MVP (ТЗ §12)
+      Целевое состояние seed-базы для релиза MVP:
+      - **6 локалей:** `en`, `ru`, `es`, `pt` (Brazil), `fr`, `de`. Каждое слово (`civilian_word`, `impostor_word`)
+        и `name`/`description` каждой категории обязаны иметь переводы на все 6 языков.
+      - **`description` категории** — локализованный объект (`{ en, ru, es, pt, fr, de }`), обязателен для всех категорий.
+      - **Минимум 3 premium-категории** (`is_premium: true`) с полным наполнением словами на все 6 локалей.
+      - Free-категории — для пробной игры и offline-бандла; premium-категории защищены premium-gating
+        (`GET /categories/{id}/words` → `403` без активной подписки).
 
-      ### Структура файла
+      > **Расхождение код↔ТЗ (open question):** на момент написания `docs/seed_words.json` содержит только
+      > `en`/`ru`, а `api/seed.py` грузит только эти 2 локали (`for locale in ["en", "ru"]`) и при INSERT
+      > категории записывает пустой `description` (`{}`). Приведение seed-данных и `seed.py` к контент-контракту
+      > выше — задача backend-агента (см. `100-known-tech-debt.md#TD-001`).
 
+      ### Структура файла (целевая)
       ```json
       {
         "meta": {
-          "description": "Seed word database for free-tier users. 10 categories, 20 words each.",
-          "locales": ["en", "ru"],
+          "description": "Seed word database. Categories with full localization.",
+          "locales": ["en", "ru", "es", "pt", "fr", "de"],
           "modes": ["standard", "party"]
         },
         "categories": [
           {
             "slug": "animals",
-            "name": { "en": "Animals", "ru": "Животные" },
+            "name": { "en": "Animals", "ru": "Животные", "es": "Animales", "pt": "Animais", "fr": "Animaux", "de": "Tiere" },
+            "description": { "en": "Guess the animal", "ru": "Угадай животное", "es": "...", "pt": "...", "fr": "...", "de": "..." },
             "is_premium": false,
             "words": [
               {
-                "civilian_word": { "en": "Elephant", "ru": "Слон" },
-                "impostor_word": { "en": "Mammoth", "ru": "Мамонт" },
+                "civilian_word": { "en": "Elephant", "ru": "Слон", "es": "Elefante", "pt": "Elefante", "fr": "Éléphant", "de": "Elefant" },
+                "impostor_word": { "en": "Mammoth", "ru": "Мамонт", "es": "Mamut", "pt": "Mamute", "fr": "Mammouth", "de": "Mammut" },
                 "difficulty": "easy"
-              },
-              {
-                "civilian_word": { "en": "Dolphin", "ru": "Дельфин" },
-                "impostor_word": { "en": "Shark", "ru": "Акула" },
-                "difficulty": "easy"
-              },
-              {
-                "civilian_word": { "en": "Eagle", "ru": "Орёл" },
-                "impostor_word": { "en": "Hawk", "ru": "Ястреб" },
-                "difficulty": "medium"
               }
             ]
-          },
-          "... (+ 9 категорий, 17 слов в animals и далее — см. полный файл)"
+          }
         ]
       }
       ```
 
-      ---
-
-      ### Категории в файле
-
-      | Slug | EN | RU | Слов |
-      |---|---|---|---|
-      | `animals` | Animals | Животные | 20 |
-      | `food` | Food | Еда | 20 |
-      | `sports` | Sports | Спорт | 20 |
-      | `professions` | Professions | Профессии | 20 |
-      | `places` | Places | Места | 20 |
-      | `transport` | Transport | Транспорт | 20 |
-      | `nature` | Nature | Природа | 20 |
-      | `technology` | Technology | Технологии | 20 |
-      | `movies` | Movies & TV | Кино и сериалы | 20 |
-      | `science` | Science | Наука | 20 |
-
-      ---
-
       ### Поля каждого слова
-
       | Поле | Тип | Описание |
       |---|---|---|
-      | `civilian_word` | `{ en, ru }` | Слово для мирных игроков |
-      | `impostor_word` | `{ en, ru }` | Слово для Undercover (Party Mode). Похожее, но отличное от civilian |
+      | `civilian_word` | `LocalizedString` (6 локалей) | Слово для мирных игроков |
+      | `impostor_word` | `LocalizedString` (6 локалей) \| null | Слово для Undercover (Party Mode). Похожее, но отличное от civilian |
       | `difficulty` | `easy / medium / hard` | Сложность угадывания |

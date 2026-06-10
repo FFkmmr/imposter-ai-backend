@@ -25,6 +25,19 @@ class Settings(BaseSettings):
 
     adapty_webhook_secret: str = ""
 
+    # === Subscription tiers (Adapty webhook token economy, ADR-002) ===
+    # SKU маппинг vendor_product_id → грант токенов. product_id по умолчанию пустые
+    # (должны быть заданы в проде), гранты имеют разумные дефолты.
+    subscription_product_weekly: str = ""
+    subscription_product_yearly: str = ""
+    subscription_tokens_weekly: int = 100
+    subscription_tokens_yearly: int = 1500
+    subscription_tokens_grant: int = 50
+
+    # === AI token spend (ADR-003) ===
+    # Стоимость одной фактической выдачи AI-слова в POST /ai/generate-theme.
+    ai_theme_token_cost: int = 1
+
     debug: bool = False
     log_level: str = "INFO"
 
