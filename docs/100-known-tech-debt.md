@@ -6,6 +6,8 @@
 |---|---|---|---|
 | TD-001 | Seed-контент не соответствует контент-контракту MVP (6 локалей + description + premium) | Done | backend |
 | TD-002 | Списание токенов за AI-генерацию не спроектировано (out of scope webhook-переработки) | Done | architect |
+| TD-003 | api/Dockerfile запускает процесс от root (нет non-root USER) | Open | devops |
+| TD-004 | Базовые образы запиннены по тегу, не по digest | Open | devops |
 
 ---
 
@@ -88,3 +90,56 @@
 - `docs/backend_spec.md` §3 («Premium-gating и токеномика списания», «Порядок проверок»), §4 («Списание токенов за AI-генерацию», Q-BILL-1), §6, §10
 - `docs/openapi.yaml` — `AIThemeResponse`, `POST /ai/generate-theme`
 - `docs/adr/ADR-002-adapty-bearer-auth-token-economy.md`
+
+---
+
+## TD-003 — api/Dockerfile запускает процесс от root
+
+**Статус:** Open
+**Severity:** major (container security)
+**Обнаружено:** 2026-06-10 (документирование прод-развёртывания)
+**Владелец:** devops
+
+### Суть
+`api/Dockerfile` (`FROM python:3.12-slim`) не создаёт и не переключается на непривилегированного пользователя — `uvicorn` и все процессы контейнера выполняются от `root`. В проде контейнер `api` смонтирован в shared-сервере за общим Traefik (см. `docs/07-deployment.md`).
+
+### Влияние
+- При компрометации приложения процесс имеет права `root` внутри контейнера — расширяет последствия RCE/escape.
+- Нарушает baseline container-security (принцип наименьших привилегий).
+
+### План устранения (devops)
+1. В `api/Dockerfile` создать системного пользователя (например `appuser`) и переключиться на него (`USER appuser`) перед `CMD`.
+2. Убедиться, что смонтированные `:ro`-ключи (`/app/keys`) и рабочий каталог читаемы этим пользователем.
+3. Проверить, что `alembic upgrade head` / `seed.py` / `uvicorn` стартуют без root.
+
+### Cross-ref
+- `docs/07-deployment.md` §5, §12
+- Код: `api/Dockerfile`, `docker-compose.prod.yml`
+
+---
+
+## TD-004 — Базовые образы запиннены по тегу, не по digest
+
+**Статус:** Open
+**Severity:** minor
+**Обнаружено:** 2026-06-10 (документирование прод-развёртывания)
+**Владелец:** devops
+
+### Суть
+Базовые образы запиннены по подвижному тегу, а не по неизменяемому digest:
+- `api/Dockerfile`: `python:3.12-slim`;
+- `docker-compose.prod.yml`: `postgres:16-alpine`, `redis:7-alpine`.
+
+При `--build`/`pull` тег может разрешиться в обновлённый образ → невоспроизводимость и риск незаметного дрейфа.
+
+### Влияние
+- Деплой не полностью воспроизводим: один и тот же commit может собраться на разных базовых образах.
+- Потенциальный supply-chain-риск при подмене/обновлении тега.
+
+### План устранения (devops)
+1. Зафиксировать образы по digest (`image@sha256:...`) или ввести политику обновления digest'ов.
+2. Согласовать с процессом обновления безопасности базовых образов.
+
+### Cross-ref
+- `docs/07-deployment.md` §5, §12
+- Код: `api/Dockerfile`, `docker-compose.prod.yml`
