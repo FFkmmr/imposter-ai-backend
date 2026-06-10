@@ -1,0 +1,82 @@
+# Production stack for imposter-ai-backend.
+# Standalone (does NOT extend docker-compose.yml) — no dev bind-mounts (./api),
+# no host port publishing. Edge routing handled by shared Traefik on network `web`.
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      REDIS_HOST: redis
+    # Override dev CMD: no --reload in production.
+    command: sh -c "alembic upgrade head && python seed.py && uvicorn main:app --host 0.0.0.0 --port 8000"
+    expose:
+      - "8000"
+    volumes:
+      - ./keys:/app/keys:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - web
+      - default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.imposterai.rule=Host(`nexaliohub.shop`)"
+      - "traefik.http.routers.imposterai.entrypoints=websecure"
+      - "traefik.http.routers.imposterai.tls.certresolver=le"
+      - "traefik.http.services.imposterai.loadbalancer.server.port=8000"
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - default
+
+networks:
+  web:
+    external: true
+  default:
+
+volumes:
+  postgres_data:
+  redis_data:
